@@ -235,15 +235,59 @@ fn lc060_pcr_reports_its_identification_and_holds_dfp() {
     movec_to(&mut cpu, &mut bus, 0x808, 0);
     movec_from(&mut cpu, &mut bus, 0x808);
     assert_eq!(cpu.dar[0], 0x0431_0102, "DFP held set");
+}
 
-    // FADD.X FP0,FP1 still takes the FPU-disabled exception.
-    bus.write_word_at(0x0210, 0xF200);
-    bus.write_word_at(0x0212, 0x00A2);
-    cpu.pc = 0x0210;
-    step(&mut cpu, &mut bus);
-    assert_eq!(cpu.pc, 0x0340, "disabled FPU vectors through Line-F");
-    let sp = cpu.dar[15];
-    assert_eq!(bus.read_word(sp.wrapping_add(6)), 0x402C, "format $4 frame");
+#[test]
+fn pcr_dfp_disables_every_fp_instruction_class_on_68060() {
+    // Each case is a complete instruction at 0x0210. With the FPU disabled
+    // none may execute, branch, or take the unimplemented-instruction
+    // frame: all restart through the format $4 FPU-disabled exception.
+    let cases: [(&str, &[u16]); 8] = [
+        ("FADD.X FP0,FP1", &[0xF200, 0x00A2]),
+        ("FBT.W", &[0xF28F, 0x0010]),
+        ("FBT.L", &[0xF2CF, 0x0000, 0x0010]),
+        ("FST D0", &[0xF240, 0x000F]),
+        ("FDBF D0", &[0xF248, 0x0000, 0xFFFC]),
+        ("FTRAPT", &[0xF27C, 0x000F]),
+        ("FSAVE (A0)", &[0xF310]),
+        ("FRESTORE (A0)", &[0xF350]),
+    ];
+    for lc060 in [false, true] {
+        for (name, words) in cases {
+            let (mut cpu, mut bus) = if lc060 {
+                setup_lc060()
+            } else {
+                let (mut cpu, mut bus) = setup_060();
+                movec_to(&mut cpu, &mut bus, 0x808, 0x02); // set DFP
+                (cpu, bus)
+            };
+            for (i, &word) in words.iter().enumerate() {
+                bus.write_word_at(0x0210 + 2 * i as u32, word);
+            }
+            cpu.pc = 0x0210;
+            step(&mut cpu, &mut bus);
+            assert_eq!(
+                cpu.pc, 0x0340,
+                "{name} (lc060={lc060}) vectors through Line-F"
+            );
+            let sp = cpu.dar[15];
+            assert_eq!(
+                bus.read_word(sp.wrapping_add(6)),
+                0x402C,
+                "{name} (lc060={lc060}) stacks the format $4 disabled frame"
+            );
+            assert_eq!(
+                bus.read_long(sp.wrapping_add(2)),
+                0x0210,
+                "{name} restart PC"
+            );
+            assert_eq!(
+                bus.read_long(sp.wrapping_add(0xC)),
+                0x0210,
+                "{name} faulted PC"
+            );
+        }
+    }
 }
 
 #[test]
