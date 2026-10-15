@@ -209,6 +209,43 @@ fn movec_pcr_round_trips_with_read_only_identification() {
     );
 }
 
+/// The FPU-less MC68LC060/MC68EC060: `setup_060` reset again with no FPU
+/// fitted.
+fn setup_lc060() -> (CpuCore, TestBus) {
+    let (mut cpu, mut bus) = setup_060();
+    cpu.fpu_present = false;
+    cpu.reset(&mut bus);
+    cpu.pc = 0x0200;
+    cpu.set_sr(0x2700);
+    (cpu, bus)
+}
+
+#[test]
+fn lc060_pcr_reports_its_identification_and_holds_dfp() {
+    let (mut cpu, mut bus) = setup_lc060();
+    movec_from(&mut cpu, &mut bus, 0x808);
+    assert_eq!(
+        cpu.dar[0], 0x0431_0102,
+        "LC/EC060 identification $0431, revision 1, DFP set from reset"
+    );
+    // EDEBUG/ESS stay writable; clearing DFP cannot enable an absent FPU.
+    movec_to(&mut cpu, &mut bus, 0x808, 0x81);
+    movec_from(&mut cpu, &mut bus, 0x808);
+    assert_eq!(cpu.dar[0], 0x0431_0100 | 0x83);
+    movec_to(&mut cpu, &mut bus, 0x808, 0);
+    movec_from(&mut cpu, &mut bus, 0x808);
+    assert_eq!(cpu.dar[0], 0x0431_0102, "DFP held set");
+
+    // FADD.X FP0,FP1 still takes the FPU-disabled exception.
+    bus.write_word_at(0x0210, 0xF200);
+    bus.write_word_at(0x0212, 0x00A2);
+    cpu.pc = 0x0210;
+    step(&mut cpu, &mut bus);
+    assert_eq!(cpu.pc, 0x0340, "disabled FPU vectors through Line-F");
+    let sp = cpu.dar[15];
+    assert_eq!(bus.read_word(sp.wrapping_add(6)), 0x402C, "format $4 frame");
+}
+
 #[test]
 fn movec_buscr_does_not_alias_dacr0_on_68060() {
     let (mut cpu, mut bus) = setup_060();
