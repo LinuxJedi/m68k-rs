@@ -235,6 +235,60 @@ fn pflusha_and_pmove_flush_but_pmovefd_does_not() {
 }
 
 #[test]
+fn pmove_flush_follows_its_operand_fetch() {
+    // A second table maps page 7, where the PMOVE (A0),CRP operand lives,
+    // somewhere else. Fetching the operand through the old root caches
+    // page 7's old translation; the flush after the write must drop it.
+    let mut bus = TestBus::new();
+    let mut cpu = mmu_030(&mut bus);
+    let new_root = 0x1_4000u32;
+    for page in 0..32u32 {
+        let phys = if page == 7 { 0xD } else { page };
+        bus.write_long(new_root + page * 4, (phys << 12) | 1);
+    }
+    bus.write_long(0x7008, 2);
+    bus.write_long(0x700C, new_root);
+    cpu.set_a(0, 0x7008);
+    run(&mut cpu, &mut bus, &[0xF010, 0x4C00]);
+    assert_eq!(cpu.mmu_crp_aptr, new_root);
+    assert_eq!(data(&mut cpu, &mut bus, 0x7004), 0xD004);
+}
+
+#[test]
+fn pmove_operand_fetch_uses_the_cached_translation() {
+    // Page 7 is cached, then its descriptor is edited without a flush: the
+    // operand fetch still goes through the cached translation, as it does
+    // on the part, so PMOVE (A0),TC reads the TC from the old page.
+    let mut bus = TestBus::new();
+    let mut cpu = mmu_030(&mut bus);
+    assert_eq!(data(&mut cpu, &mut bus, 0x7004), 0x7004);
+    bus.map(7, 0xE);
+    bus.write_long(0x7000, TC);
+    bus.write_long(0xE000, 0);
+    cpu.set_a(0, 0x7000);
+    run(&mut cpu, &mut bus, &[0xF010, 0x4000]);
+    assert_eq!(cpu.mmu_tc, TC);
+    assert!(cpu.pmmu_enabled);
+    // The write flushed the stale entry: the edit is now in force.
+    assert_eq!(data(&mut cpu, &mut bus, 0x7004), 0xE004);
+}
+
+#[test]
+fn pload_of_an_invalidated_page_drops_its_old_entry() {
+    let mut bus = TestBus::new();
+    let mut cpu = mmu_030(&mut bus);
+    assert_eq!(data(&mut cpu, &mut bus, 0x9004), 0x9004);
+    // Invalidate the descriptor: the cached entry survives the edit ...
+    bus.write_long(TABLE + 9 * 4, 0);
+    assert_eq!(data(&mut cpu, &mut bus, 0x9004), 0x9004);
+    // ... until PLOADR #5,(A0) searches the page and finds it invalid.
+    cpu.set_a(0, 0x9000);
+    run(&mut cpu, &mut bus, &[0xF010, 0x2215]);
+    let err = translate_address(&mut cpu, &mut bus, 0x9004, false, true, false).unwrap_err();
+    assert_eq!(err.kind, MmuFaultKind::AccessLevelViolation);
+}
+
+#[test]
 fn pload_fills_the_entry_ahead_of_the_access() {
     let mut bus = TestBus::new();
     let mut cpu = mmu_030(&mut bus);
