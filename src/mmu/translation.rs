@@ -423,10 +423,13 @@ fn translate_030<B: AddressBus>(
 
 /// 68030 PLOAD: search the tables for `logical` in the `fc` address space
 /// and load the resulting translation into the ATC, as a translated access
-/// would but without making one. A transparently translated address, an
-/// invalid translation, and a supervisor-only page probed from a user space
-/// load nothing. Not modelled: the used/modified write-back the R/W form
-/// selects.
+/// would but without making one. The page's previous entry goes first, so
+/// a search that finds no usable translation -- a transparently translated
+/// address, an invalid descriptor, a supervisor-only page probed from a
+/// user space -- leaves the next access to search and fault rather than
+/// hit a stale mapping (the silicon loads an entry marking the translation
+/// invalid; this cache keeps no such entries). Not modelled: the
+/// used/modified write-back the R/W form selects.
 pub(crate) fn pload_030<B: AddressBus>(
     cpu: &mut CpuCore,
     bus: &mut B,
@@ -437,6 +440,7 @@ pub(crate) fn pload_030<B: AddressBus>(
     if !cpu.pmmu_enabled || !cpu.has_pmmu {
         return;
     }
+    cpu.atc_030.flush_fc_page(fc, 7, logical);
     let Some(shift) = page_shift_030(cpu.mmu_tc) else {
         return;
     };

@@ -2279,13 +2279,7 @@ impl CpuCore {
                 _ => 0,
             }
         } else {
-            // A PMOVE to TC, SRP or CRP flushes the ATC unless FD (bit 8,
-            // the PMOVEFD form) asks it not to. The TT registers are
-            // checked ahead of the ATC, so writing them needs no flush.
-            if matches!(preg, 0x10 | 0x12 | 0x13) && modes & 0x0100 == 0 {
-                self.atc_030.flush_all();
-            }
-            match preg {
+            let cycles = match preg {
                 0x10 => {
                     // TC (32)
                     let v = self.read_resolved_ea(bus, ea, Size::Long);
@@ -2331,7 +2325,18 @@ impl CpuCore {
                     4
                 }
                 _ => 0,
+            };
+            // A PMOVE to TC, SRP or CRP flushes the ATC unless FD (bit 8,
+            // the PMOVEFD form) asks it not to. The flush follows the
+            // operand fetch: those reads translate through the mapping in
+            // force before the write, using and refilling the ATC, and
+            // anything they leave behind must not outlive the new root.
+            // The TT registers are checked ahead of the ATC, so writing
+            // them needs no flush.
+            if cycles != 0 && matches!(preg, 0x10 | 0x12 | 0x13) && modes & 0x0100 == 0 {
+                self.atc_030.flush_all();
             }
+            cycles
         }
     }
 
