@@ -437,11 +437,16 @@ impl ResidentMmu {
 /// is the address `translate` would return, and a `None` leaves the access
 /// to `translate` to search the tables and raise any fault.
 ///
-/// Unlike `translate` it leaves the 68030 ATC's replacement order as it
-/// was. The order records the uses the interpreter makes, so it does not
-/// depend on which instructions ran from the window or from compiled traces
-/// (which make no instruction fetches): a state saved mid-run resumes, with
-/// empty JIT caches, to the same ATC behaviour as the uninterrupted run.
+/// It leaves the 68030 ATC's replacement order as it was, and so does
+/// `translate` itself while the window translates: no hit in a batch
+/// records a use, whether it came through the window, a compiled trace or
+/// the interpreter's bus path, so entries age by when table searches loaded
+/// them. Table searches happen at the same instructions whichever way an
+/// instruction ran, so the order does not depend on which instructions ran
+/// from compiled traces (which reach memory through the window and make no
+/// instruction fetches): a state saved mid-run resumes, with empty JIT
+/// caches, to the same ATC behaviour as the uninterrupted run. Outside
+/// `run_batch`, hits record uses and replacement is least recently used.
 ///
 /// `mmu` must be `ResidentMmu::of(cpu)`, and the access an ordinary one (no
 /// MOVES function-code override).
@@ -509,10 +514,21 @@ fn translate_030<B: AddressBus>(
         1
     };
     let shift = page_shift_030(cpu.mmu_tc);
-    if let Some(shift) = shift
-        && let Some(page_base) = cpu.atc_030.lookup(fc as u8, logical >> shift, shift, write)
-    {
-        return Ok(page_base.wrapping_add(low_bits(logical, 32 - shift)));
+    if let Some(shift) = shift {
+        let page = logical >> shift;
+        // While `run_batch` translates through its fastmem window, no hit
+        // records a use, this one included: compiled traces reach memory
+        // through the window and fetch no instructions, so uses recorded
+        // here would make the saved replacement order depend on which
+        // instructions ran from traces (see `probe_resident`).
+        let hit = if cpu.fm_mmu.enabled() {
+            cpu.atc_030.probe(fc as u8, page, shift, write)
+        } else {
+            cpu.atc_030.lookup(fc as u8, page, shift, write)
+        };
+        if let Some(page_base) = hit {
+            return Ok(page_base.wrapping_add(low_bits(logical, 32 - shift)));
+        }
     }
     let w = walk_030(cpu, bus, logical, fc, u32::MAX);
     match w.end {

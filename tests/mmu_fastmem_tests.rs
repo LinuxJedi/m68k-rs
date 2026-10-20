@@ -800,3 +800,111 @@ fn tracked_window_stores_reach_the_bus_at_physical_frames() {
     assert_eq!(reference.1.copies, 0, "no notifications under translation");
     assert_eq!(tracked.1.copies, 0, "none from the tracked window either");
 }
+
+/// Four A-line-terminated stages for the replacement-order tests:
+/// 0: load DATA's then DATA2's ATC entry; 1: a hot read-modify-write loop on
+/// DATA (traced once warm); 2: load 20 more pages (`A1` stepping by `A3`),
+/// filling the 22-entry ATC and evicting; 3: read DATA2 then DATA again.
+const REPLACEMENT_STAGES: [u16; 16] = [
+    0x2210, 0x2212, ALINE, // MOVE.L (A0),D1 ; MOVE.L (A2),D1
+    0xD190, 0x5280, 0x51CF, 0xFFFA, ALINE, // loop: ADD.L D0,(A0) ; ADDQ.L #1,D0 ; DBRA D7
+    0x2411, 0xD3CB, 0x51CE, 0xFFFA, ALINE, // fill: MOVE.L (A1),D2 ; ADDA.L A3,A1 ; DBRA D6
+    0x2612, 0x2210, ALINE, // MOVE.L (A2),D3 ; MOVE.L (A0),D1
+];
+
+fn replacement_setup(cpu: &mut CpuCore, bus: &mut Bus) {
+    cpu.set_a(0, DATA);
+    cpu.set_a(2, DATA2);
+    cpu.set_d(7, 2_999);
+    cpu.set_a(1, 0x2_C000);
+    cpu.set_a(3, 0x1000);
+    cpu.set_d(6, 19);
+    bus.poke_long(phys(DATA2), 0xC0C0_0001);
+    bus.poke_long(0x2_4000, 0xA1A1_0002);
+    bus.poke_long(0x2_5000, 0xC1C1_0003);
+}
+
+/// Before the last stage the host remaps DATA and DATA2 to new frames
+/// without a flush: a resident entry keeps the stale frame, an evicted one
+/// searches the tables again.
+fn replacement_remap(stage: usize, _cpu: &mut CpuCore, bus: &mut Bus) {
+    if stage == 3 {
+        bus.map_030(TABLE, DATA, 0x2_4000, 0);
+        bus.map_030(TABLE, DATA2, 0x2_5000, 0);
+    }
+}
+
+/// Run the replacement stages twice on one fresh thread: first with an
+/// empty trace cache, then from the same start with the traces the first
+/// run compiled. Returns (cold, warm).
+fn cold_and_warm(setup: fn(&mut CpuCore, &mut Bus)) -> ((CpuCore, Bus), (CpuCore, Bus)) {
+    std::thread::spawn(move || {
+        let run = || {
+            let mut m = machine(
+                true,
+                Mmu::Mc68030 { tc: TC_030 },
+                &REPLACEMENT_STAGES,
+                &setup,
+            );
+            for stage in 0..4 {
+                replacement_remap(stage, &mut m.0, &mut m.1);
+                run_batches(&mut m.0, &mut m.1);
+            }
+            m
+        };
+        let cold = run();
+        let warm = run();
+        (cold, warm)
+    })
+    .join()
+    .unwrap()
+}
+
+/// The 68030 ATC's replacement order is saved state, so it must not depend
+/// on which instructions ran from compiled traces, which access memory
+/// through the window and fetch no instructions. While the window
+/// translates, no hit records a use -- the interpreter's own bus-path hits
+/// included -- so entries age by when they were loaded. A cold run (the
+/// interpreter, then traces as they compile) and a warm one (traces from the
+/// start) leave the same ATC, evict the same entries and keep the same
+/// stale translation.
+fn assert_replacement_order_ignores_the_trace_cache(
+    label: &str,
+    setup: fn(&mut CpuCore, &mut Bus),
+) {
+    let (cold, warm) = cold_and_warm(setup);
+    assert_same(label, &cold, &warm);
+    assert_eq!(cold.0.atc_030, warm.0.atc_030, "{label}: ATC");
+    // Loads: code, DATA, DATA2, then 20 fill pages. The 20th fill page
+    // evicts the code page, which the next fetch reloads in place of DATA:
+    // DATA2 is still resident with its stale frame, DATA is searched anew.
+    assert_eq!(
+        warm.0.d(3),
+        0xC0C0_0001,
+        "{label}: DATA2 kept its stale frame"
+    );
+    assert_eq!(warm.0.d(1), 0xA1A1_0002, "{label}: DATA was evicted");
+}
+
+/// With a tracked window the interpreter runs every memory instruction
+/// through full dispatch and `translate`, while a warm trace runs it
+/// through the window.
+#[cfg(feature = "jit")]
+#[test]
+fn atc_replacement_order_ignores_the_trace_cache_with_a_tracked_window() {
+    assert_replacement_order_ignores_the_trace_cache("tracked", |cpu, bus| {
+        replacement_setup(cpu, bus);
+        bus.tracked = true;
+    });
+}
+
+/// With the code outside the window the interpreter fetches every
+/// instruction through `translate`, while a warm trace fetches none.
+#[test]
+fn atc_replacement_order_ignores_the_trace_cache_with_code_outside_the_window() {
+    assert_replacement_order_ignores_the_trace_cache("code outside", |cpu, bus| {
+        replacement_setup(cpu, bus);
+        bus.poke_words(0xB000, &REPLACEMENT_STAGES);
+        bus.map_030(TABLE, CODE, 0xB000, 0);
+    });
+}
