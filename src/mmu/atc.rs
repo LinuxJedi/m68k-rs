@@ -135,7 +135,9 @@ struct Atc030Entry {
 ///
 /// Like the silicon it keeps only resident translations of whole pages (the
 /// page size TC configures, also for an early-termination descriptor that
-/// maps more), is replaced least recently used first, and is invalidated by
+/// maps more), is replaced least recently used first (in a `run_batch` with
+/// a translated fastmem window hits record no use, so entries age by load
+/// order there; see `mmu::probe_resident`), and is invalidated by
 /// PFLUSH and by a PMOVE to TC, SRP or CRP without FD. A CPU write to a
 /// descriptor does not reach it; software flushes, as on real hardware. A
 /// write to a write-protected page, and any access that would fault, re-walk
@@ -238,9 +240,10 @@ impl Atc030 {
         Some(e.phys_page)
     }
 
-    /// [`Self::lookup`] without recording a use: for reads made on the
-    /// side (the trace recorder decoding code the CPU already fetched) that
-    /// must leave the replacement order as it was.
+    /// [`Self::lookup`] without recording a use: for `run_batch` while its
+    /// fastmem window translates, where no hit may record one (see
+    /// `mmu::probe_resident`), and for reads made on the side, such as the
+    /// trace recorder decoding code the CPU already fetched.
     #[inline]
     pub fn probe(&self, fc: u8, page: u32, shift: u32, write: bool) -> Option<u32> {
         if u32::from(self.shift) != shift {
