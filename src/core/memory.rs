@@ -285,6 +285,51 @@ pub trait AddressBus {
         self.last_fetch_was_cached()
     }
 
+    /// Synchronize the embedder during [`CpuCore::run_batch`](super::cpu::CpuCore::run_batch).
+    ///
+    /// `retired` is the cumulative instruction count in this batch; `pc` and
+    /// `sr` describe the next instruction boundary. Calls may repeat the same
+    /// count. Native traces can retire many instructions between calls, up to
+    /// the caller's remaining budget: this is not a per-instruction hook or a
+    /// way to interrupt a running native trace. Bound the batch budget when a
+    /// device deadline must not be crossed.
+    ///
+    /// The hook runs before ordinary instruction dispatch, including after a
+    /// native prefix exits to a bus access. Return `true` to yield with
+    /// [`BatchExit::BoundaryRequested`](crate::BatchExit::BoundaryRequested);
+    /// completed work is retained and the next instruction has not executed.
+    ///
+    /// Once an instruction has completed in the batch, an opcode fetched
+    /// through the bus (not through a memory window) is followed by a second
+    /// call with the same `retired` count and `pc`, so a boundary the fetch
+    /// itself raised is honored before that instruction runs. Yielding there
+    /// discards the fetched opcode: the bus sees the same fetch again when
+    /// execution resumes. The first instruction of a batch always runs once
+    /// fetched, so a batch makes progress even if every fetch raises a
+    /// boundary. Account for any final work from
+    /// `BatchResult::instructions` on return, since there need not be a final
+    /// hook call when a budget, trap, or watched PC ends the batch.
+    ///
+    /// Do not relocate or resize an exposed memory window from this hook.
+    /// Return to the caller before changing the window's address range or
+    /// permissions. The default is a no-op, compiled away for functional buses.
+    #[inline]
+    fn batch_boundary(&mut self, _retired: u32, _pc: u32, _sr: u16) -> bool {
+        false
+    }
+
+    /// Whether [`CpuCore::run_batch`](super::cpu::CpuCore::run_batch) calls
+    /// [`batch_boundary`](Self::batch_boundary) during the batch it is
+    /// starting. The core asks once, after capturing the memory windows and
+    /// before the first instruction. Return `false` when nothing in this
+    /// batch needs to be observed before it returns: the batch then runs
+    /// without boundary calls until its budget, a trap, STOP or a watched PC
+    /// ends it. The default keeps the calls.
+    #[inline]
+    fn wants_batch_boundaries(&mut self) -> bool {
+        true
+    }
+
     /// Take a pending request to return from cycle-scheduled execution at
     /// the next completed instruction or interrupt-entry boundary.
     ///

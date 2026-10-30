@@ -180,6 +180,8 @@ pub(crate) enum CachedRunResult {
 
 /// Result of the instruction-budgeted fast loop used by `run_batch`.
 pub(crate) enum BatchInnerExit {
+    /// The embedder requested synchronization before the next instruction.
+    Boundary,
     /// The remaining instruction budget hit zero.
     Budget,
     /// Execution reached a PC in the caller's watch list.
@@ -1021,6 +1023,7 @@ impl CpuCore {
         watch_pcs: &[u32],
         retired: &mut u32,
         probe_on_entry: bool,
+        boundaries: bool,
     ) -> BatchInnerExit {
         // Only a fully dispatched instruction, outside this loop, switches
         // the window between physical and translated, so the loop is
@@ -1033,6 +1036,7 @@ impl CpuCore {
                 watch_pcs,
                 retired,
                 probe_on_entry,
+                boundaries,
             );
         }
         self.run_decoded_simple_batch_in::<B, false>(
@@ -1041,6 +1045,7 @@ impl CpuCore {
             watch_pcs,
             retired,
             probe_on_entry,
+            boundaries,
         )
     }
 
@@ -1060,10 +1065,18 @@ impl CpuCore {
         watch_pcs: &[u32],
         retired: &mut u32,
         probe_on_entry: bool,
+        boundaries: bool,
     ) -> BatchInnerExit {
         // Whatever ran since the last decoded run may have changed the ATC.
         self.forget_code_page();
-        self.run_decoded_simple_batch_in::<B, true>(bus, budget, watch_pcs, retired, probe_on_entry)
+        self.run_decoded_simple_batch_in::<B, true>(
+            bus,
+            budget,
+            watch_pcs,
+            retired,
+            probe_on_entry,
+            boundaries,
+        )
     }
 
     #[inline]
@@ -1074,6 +1087,7 @@ impl CpuCore {
         watch_pcs: &[u32],
         retired: &mut u32,
         probe_on_entry: bool,
+        boundaries: bool,
     ) -> BatchInnerExit {
         let cpu_type = self.cpu_type;
         let watch = !watch_pcs.is_empty();
@@ -1083,6 +1097,10 @@ impl CpuCore {
         let mut probe = probe_on_entry && trace_jit::has_trace_candidates();
 
         while remaining > 0 {
+            if boundaries && bus.batch_boundary(*retired, self.pc, self.get_sr()) {
+                trace_jit::stop_recording(self, trace_jit::RecordingStop::HostBoundary);
+                return BatchInnerExit::Boundary;
+            }
             if probe && remaining >= trace_jit::TRACE_MIN_OPS as u32 {
                 // run_batch is instruction-budgeted, not cycle-budgeted.
                 // A long-running self-loop can consume the synthetic cycle
@@ -1130,6 +1148,7 @@ impl CpuCore {
             }
 
             self.ppc = self.pc;
+            let mut fetched_via_bus = false;
             let opcode = if self.fm_len != 0 && (self.pc & 1) == 0 {
                 // Fetch through the fastmem window: one bounds check
                 // instead of a bus call. Odd/out-of-window PCs, and PCs the
@@ -1159,6 +1178,7 @@ impl CpuCore {
                     if self.run_mode == RUN_MODE_BERR_AERR_RESET {
                         return BatchInnerExit::Fault;
                     }
+                    fetched_via_bus = true;
                     opcode
                 }
             } else {
@@ -1166,8 +1186,23 @@ impl CpuCore {
                 if self.run_mode == RUN_MODE_BERR_AERR_RESET {
                     return BatchInnerExit::Fault;
                 }
+                fetched_via_bus = true;
                 opcode
             };
+            // A bus fetch can itself be the access the host must synchronize
+            // with. Yield before dispatch, exactly as full dispatch does; the
+            // opcode is fetched again when the batch resumes. Window fetches
+            // have no side effects and skip the call, and so does the first
+            // instruction of a batch, which must make progress.
+            if boundaries
+                && fetched_via_bus
+                && *retired != 0
+                && bus.batch_boundary(*retired, self.ppc, self.get_sr())
+            {
+                self.pc = self.ppc;
+                trace_jit::stop_recording(self, trace_jit::RecordingStop::HostBoundary);
+                return BatchInnerExit::Boundary;
+            }
             self.ir = opcode as u32;
 
             match self.cached_decode(opcode, cpu_type) {
